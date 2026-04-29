@@ -32,7 +32,8 @@ jobs:
           python-version: "3.11"
       - name: install
         run: |
-          pip install mypy torch --index-url https://download.pytorch.org/whl/cpu
+          pip install mypy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
       - name: mypy
         run: mypy paged_eviction --ignore-missing-imports --no-site-packages
