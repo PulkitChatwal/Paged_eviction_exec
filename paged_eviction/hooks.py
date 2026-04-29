@@ -95,51 +95,100 @@ def _unwrap_engine(llm: Any) -> Any:
 
 
 def _is_v1_engine(engine: Any) -> bool:
+    # V1 engine lives in vllm.v1.*; V0 lives in vllm.engine.*
+    # Both have model_executor, so we cannot use hasattr alone.
     mod = type(engine).__module__
-    return "v1" in mod or hasattr(engine, "model_executor")
+    return "v1" in mod
 
 
 def _find_kv_caches(engine: Any) -> List[torch.Tensor]:
     """Walk the engine object graph to locate per-layer KV cache tensors."""
-    paths = [
+
+    # ---- V1 paths ----
+    v1_paths = [
         "model_executor.driver_worker.worker.model_runner.kv_cache",
         "model_executor.driver_worker.model_runner.kv_cache",
         "driver_worker.worker.model_runner.kv_cache",
         "driver_worker.model_runner.kv_cache",
     ]
-    for path in paths:
+    for path in v1_paths:
         val = _getattr_path(engine, path)
-        if isinstance(val, (list, tuple)) and len(val) > 0:
+        if _valid_kv(val):
             return list(val)
 
-    # V0: engine.workers[0].model_runner.kv_cache
+    # ---- V0 primary: model_executor.driver_worker (GPUExecutor layout) ----
+    v0_paths = [
+        "model_executor.driver_worker.model_runner.kv_cache",
+        "model_executor.driver_worker.cache_engine[0].gpu_cache",
+    ]
+    for path in v0_paths:
+        val = _getattr_path(engine, path)
+        if _valid_kv(val):
+            return list(val)
+
+    # ---- V0: engine.workers list ----
     workers = getattr(engine, "workers", None)
     if workers:
         worker = workers[0]
-        for attr in ["model_runner.kv_cache", "cache_engine[0].gpu_cache"]:
+        for attr in [
+            "model_runner.kv_cache",
+            "cache_engine[0].gpu_cache",
+        ]:
             val = _getattr_path(worker, attr)
-            if isinstance(val, (list, tuple)) and len(val) > 0:
-                return list(val)
+            if _valid_kv(val):
+                return list(val)  # type: ignore[arg-type]
 
-    # V0 fallback: cache_engine
+    # ---- V0: cache_engine directly on engine ----
     ce = getattr(engine, "cache_engine", None)
     if ce is not None:
         if isinstance(ce, list):
             ce = ce[0]
         gpu = getattr(ce, "gpu_cache", None)
-        if isinstance(gpu, (list, tuple)) and len(gpu) > 0:
-            return list(gpu)
+        if _valid_kv(gpu):
+            return list(gpu)  # type: ignore[arg-type]
 
+    # ---- Last resort: depth-first search for any list of KV tensors ----
+    return _search_kv_caches(engine, depth=0)
+
+
+def _valid_kv(val: Any) -> bool:
+    """Return True if val looks like a list of per-layer KV tensors."""
+    if not isinstance(val, (list, tuple)) or len(val) == 0:
+        return False
+    first = val[0]
+    # Each element should be a tensor with at least 3 dims (2, blocks, block_size, ...)
+    return hasattr(first, "shape") and len(first.shape) >= 3
+
+
+def _search_kv_caches(obj: Any, depth: int) -> List[torch.Tensor]:
+    """Recursively search object attributes for KV cache tensors (max depth 5)."""
+    if depth > 5:
+        return []
+    for attr in vars(obj) if hasattr(obj, "__dict__") else []:
+        try:
+            val = getattr(obj, attr)
+            if _valid_kv(val):
+                return list(val)
+            if hasattr(val, "__dict__") and depth < 5:
+                result = _search_kv_caches(val, depth + 1)
+                if result:
+                    return result
+        except Exception:
+            pass
     return []
 
 
 def _find_block_size(engine: Any, kv_caches: List[torch.Tensor]) -> int:
-    for path in ["cache_config.block_size", "vllm_config.cache_config.block_size"]:
+    for path in [
+        "cache_config.block_size",
+        "vllm_config.cache_config.block_size",
+        "model_executor.driver_worker.cache_config.block_size",
+    ]:
         val = _getattr_path(engine, path)
         if isinstance(val, int) and val > 0:
             return val
     # Infer from KV cache shape: [2, total_blocks, block_size, heads, dim]
-    if kv_caches:
+    if kv_caches and len(kv_caches[0].shape) >= 3:
         return kv_caches[0].shape[2]
     return 16  # vLLM default
 
