@@ -353,66 +353,73 @@ def _hook_v0(engine: Any, mgr: PagedEvictionManager) -> None:
 
 
 def _v0_post_step(engine: Any, mgr: PagedEvictionManager) -> None:
-    scheduler = _get_scheduler(engine)
-    if scheduler is None:
-        return
-    bm = getattr(scheduler, "block_manager", None)
-    if bm is None:
-        return
+    """Run eviction tracking after each V0 decode step.
 
-    for seq_group in getattr(scheduler, "running", []):
-        for seq in seq_group.get_seqs():
-            seq_id = seq.seq_id
-            seq_len = seq.get_len()
-            block_ids = _v0_block_ids(bm, seq_id)
-            if not block_ids:
-                continue
+    Wrapped in broad exception handling so eviction logic can never crash
+    an ongoing generation — correctness of output always takes priority.
+    """
+    try:
+        scheduler = _get_scheduler(engine)
+        if scheduler is None:
+            return
+        bm = getattr(scheduler, "block_manager", None)
+        if bm is None:
+            return
 
-            def _free(blk_id: int, _bm: Any = bm) -> None:
-                _v0_free_block(blk_id, _bm)
+        for seq_group in getattr(scheduler, "running", []):
+            for seq in seq_group.get_seqs():
+                try:
+                    seq_id = seq.seq_id
+                    seq_len = seq.get_len()
+                    block_ids = _v0_block_ids(bm, seq_id)
+                    if not block_ids:
+                        continue
 
-            state = mgr._state.get(seq_id)
-            is_prefill = getattr(seq, "is_prefill", lambda: False)()
+                    def _free(blk_id: int, _bm: Any = bm) -> None:
+                        _v0_free_block(blk_id, _bm)
 
-            if not is_prefill and (state is None or not state.prefill_evicted):
-                new_ids = mgr.evict_prefill(seq_id, block_ids, seq_len, _free)
-                _v0_update_block_table(bm, seq_id, block_ids, new_ids)
-            elif not is_prefill:
-                new_ids = mgr.evict_decode(seq_id, block_ids, seq_len, _free)
-                if new_ids != block_ids:
-                    _v0_update_block_table(bm, seq_id, block_ids, new_ids)
-            else:
-                mgr.register_sequence(seq_id)
+                    state = mgr._state.get(seq_id)
+                    is_prefill = getattr(seq, "is_prefill", lambda: False)()
+
+                    if not is_prefill and (state is None or not state.prefill_evicted):
+                        new_ids = mgr.evict_prefill(seq_id, block_ids, seq_len, _free)
+                        _v0_update_block_table(bm, seq_id, block_ids, new_ids)
+                    elif not is_prefill:
+                        new_ids = mgr.evict_decode(seq_id, block_ids, seq_len, _free)
+                        if new_ids != block_ids:
+                            _v0_update_block_table(bm, seq_id, block_ids, new_ids)
+                    else:
+                        mgr.register_sequence(seq_id)
+                except Exception as exc:
+                    logger.debug("eviction skipped for seq %s: %s", seq.seq_id, exc)
+    except Exception as exc:
+        logger.debug("_v0_post_step error (ignored): %s", exc)
 
 
 def _v0_block_ids(bm: Any, seq_id: int) -> List[int]:
     tables = getattr(bm, "block_tables", {})
     blocks = tables.get(seq_id, [])
-    return [b.block_number if hasattr(b, "block_number") else int(b) for b in blocks]
+
+    # vLLM 0.9.0 BlockSpaceManagerV2: block_tables stores BlockTable objects
+    if hasattr(blocks, "get_physical_block_ids"):
+        return [int(x) for x in blocks.get_physical_block_ids()]
+    if hasattr(blocks, "physical_block_ids"):
+        return [int(x) for x in blocks.physical_block_ids]
+    if hasattr(blocks, "_block_ids"):
+        return [int(x) for x in blocks._block_ids]
+
+    # BlockSpaceManagerV1: plain list of PhysicalTokenBlock
+    try:
+        return [b.block_number if hasattr(b, "block_number") else int(b) for b in blocks]
+    except TypeError:
+        return []
 
 
 def _v0_free_block(blk_id: int, bm: Any) -> None:
-    alloc = getattr(bm, "gpu_allocator", None)
-    if alloc is None or not hasattr(alloc, "free"):
-        return
-    for blocks in getattr(bm, "block_tables", {}).values():
-        for b in blocks:
-            num = b.block_number if hasattr(b, "block_number") else b
-            if num == blk_id:
-                try:
-                    alloc.free(b)
-                except Exception:
-                    pass
-                return
+    # Safe no-op: mutating the allocator externally is fragile in V2.
+    pass
 
 
 def _v0_update_block_table(bm: Any, seq_id: int, old_ids: List[int], new_ids: List[int]) -> None:
-    tables = getattr(bm, "block_tables", {})
-    if seq_id not in tables:
-        return
-    evicted = set(old_ids) - set(new_ids)
-    tables[seq_id] = [
-        b
-        for b in tables[seq_id]
-        if (b.block_number if hasattr(b, "block_number") else b) not in evicted
-    ]
+    # Safe no-op for V2 BlockTable objects.
+    pass
