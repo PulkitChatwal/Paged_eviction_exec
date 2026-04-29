@@ -45,19 +45,23 @@ def compute_block_scores(
     kv_caches: List[torch.Tensor],
     block_ids: List[int],
     tokens_per_block: List[int],
+    block_size: int = 16,
 ) -> torch.Tensor:
     """
     Compute per-block importance score, averaged across all transformer layers.
 
+    Handles two KV cache layouts used by vLLM:
+    - 5-D layout (V1 / A100+): ``[2, num_blocks, block_size, num_heads, head_dim]``
+    - 3-D flat layout (V0 / T4): ``[2, num_blocks, block_size * num_heads * head_dim]``
+
     Args:
-        kv_caches: List of per-layer tensors, each shaped
-                   [2, total_blocks, block_size, num_heads, head_dim]
-                   where index 0 = K cache, index 1 = V cache.
+        kv_caches: List of per-layer KV tensors.
         block_ids: Physical block IDs for this sequence (logical order).
         tokens_per_block: Valid token count per block (last block may be partial).
+        block_size: Tokens per block (needed to reshape flat layout).
 
     Returns:
-        Tensor [num_blocks] — higher score means more important (keep).
+        Tensor ``[num_blocks]`` — higher score means more important (keep).
     """
     num_blocks = len(block_ids)
     if num_blocks == 0:
@@ -65,16 +69,22 @@ def compute_block_scores(
 
     device = kv_caches[0].device
     scores = torch.zeros(num_blocks, dtype=torch.float32, device=device)
+    is_flat = kv_caches[0].ndim == 3  # V0 flat: [2, blocks, flat_dim]
 
     for layer_kv in kv_caches:
-        k_cache = layer_kv[0]  # [total_blocks, block_size, num_heads, head_dim]
-        v_cache = layer_kv[1]
+        k_cache = layer_kv[0].float()
+        v_cache = layer_kv[1].float()
 
         for i, (blk_id, n_tok) in enumerate(zip(block_ids, tokens_per_block)):
             if n_tok <= 0:
                 continue
-            k = k_cache[blk_id, :n_tok].float()  # [n_tok, heads, dim]
-            v = v_cache[blk_id, :n_tok].float()
+            if is_flat:
+                # Reshape flat dim → [block_size, kv_heads * head_dim]
+                k = k_cache[blk_id].reshape(block_size, -1)[:n_tok]
+                v = v_cache[blk_id].reshape(block_size, -1)[:n_tok]
+            else:
+                k = k_cache[blk_id, :n_tok]
+                v = v_cache[blk_id, :n_tok]
             scores[i] += _token_importance(k, v).mean()
 
     scores /= len(kv_caches)
@@ -188,7 +198,7 @@ class PagedEvictionManager:
             return block_ids
 
         tpb = _tokens_per_block(seq_len, len(block_ids), self.block_size)
-        scores = compute_block_scores(self.kv_caches, block_ids, tpb)
+        scores = compute_block_scores(self.kv_caches, block_ids, tpb, self.block_size)
 
         # Protect most-recent blocks
         protected = min(self.protect_recent_blocks, len(block_ids) - 1)
@@ -262,7 +272,7 @@ class PagedEvictionManager:
             return block_ids
 
         tpb = _tokens_per_block(seq_len, len(block_ids), self.block_size)
-        scores = compute_block_scores(self.kv_caches, block_ids, tpb)
+        scores = compute_block_scores(self.kv_caches, block_ids, tpb, self.block_size)
 
         protected = min(self.protect_recent_blocks, len(block_ids) - 1)
         if protected > 0:

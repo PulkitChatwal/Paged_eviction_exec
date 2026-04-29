@@ -25,6 +25,10 @@ class Tensor:
         return self._d.shape  # type: ignore[return-value]
 
     @property
+    def ndim(self) -> int:
+        return int(self._d.ndim)
+
+    @property
     def device(self) -> str:
         return "cpu"
 

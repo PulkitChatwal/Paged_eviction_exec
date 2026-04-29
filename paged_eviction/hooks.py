@@ -4,7 +4,13 @@ vLLM integration for PagedEviction.
 Patches the *live engine instance* returned by ``LLM()`` — never patches
 classes, which avoids Python import-time class-caching issues.
 
-Supports vLLM V1 engine (default in vLLM >= 0.8) and legacy V0 engine.
+Supports:
+- vLLM V1 engine (default on Ampere+ GPUs, compute >= 8.0)
+- vLLM V0 engine (fallback on Turing/Volta GPUs like T4, compute < 8.0)
+
+KV cache layouts handled:
+- 5-D: ``[2, num_blocks, block_size, num_heads, head_dim]``  (V1 / A100)
+- 3-D: ``[2, num_blocks, block_size * num_heads * head_dim]``  (V0 / T4 flat)
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from typing import Any, List, Optional
 import torch
 
 from .config import PagedEvictionConfig
-from .manager import PagedEvictionManager
+from .manager import PagedEvictionManager, compute_block_scores
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +45,10 @@ def apply_paged_eviction(
 
     Returns:
         The attached :class:`~paged_eviction.PagedEvictionManager`.
-        Call ``.get_stats()`` on it at any time.
 
     Example::
 
-        llm = LLM(model="meta-llama/Llama-3.2-1B-Instruct")
+        llm = LLM(model="Qwen/Qwen2.5-1.5B-Instruct")
         mgr = apply_paged_eviction(llm, PagedEvictionConfig(cache_budget=1024))
         outputs = llm.generate(prompts, SamplingParams(max_tokens=512))
         print(mgr.get_stats())
@@ -86,7 +91,7 @@ def apply_paged_eviction(
 
 
 def _unwrap_engine(llm: Any) -> Any:
-    """LLM → underlying engine."""
+    """LLM -> underlying engine."""
     if hasattr(llm, "llm_engine"):
         return llm.llm_engine
     if hasattr(llm, "_engine"):
@@ -95,50 +100,43 @@ def _unwrap_engine(llm: Any) -> Any:
 
 
 def _is_v1_engine(engine: Any) -> bool:
-    # V1 engine lives in vllm.v1.*; V0 lives in vllm.engine.*
-    # Both have model_executor, so we cannot use hasattr alone.
-    mod = type(engine).__module__
-    return "v1" in mod
+    # V1 engine lives in vllm.v1.*  V0 lives in vllm.engine.*
+    # Both have model_executor so we check the module path only.
+    return "v1" in type(engine).__module__
 
 
 def _find_kv_caches(engine: Any) -> List[torch.Tensor]:
-    """Walk the engine object graph to locate per-layer KV cache tensors."""
+    """Walk the engine object graph to locate per-layer KV cache tensors.
 
-    # ---- V1 paths ----
-    v1_paths = [
+    Tries all known paths for both V0 (UniProcExecutor / WorkerWrapperBase)
+    and V1 engine layouts.  V0 on Turing GPUs (T4) stores KV caches at
+    ``model_executor.driver_worker.cache_engine[0].gpu_cache``.
+    """
+    paths = [
+        # V0 confirmed: UniProcExecutor -> WorkerWrapperBase -> CacheEngine
+        "model_executor.driver_worker.cache_engine[0].gpu_cache",
+        "model_executor.driver_worker.worker.cache_engine[0].gpu_cache",
+        # V1 paths
         "model_executor.driver_worker.worker.model_runner.kv_cache",
         "model_executor.driver_worker.model_runner.kv_cache",
         "driver_worker.worker.model_runner.kv_cache",
         "driver_worker.model_runner.kv_cache",
     ]
-    for path in v1_paths:
+    for path in paths:
         val = _getattr_path(engine, path)
         if _valid_kv(val):
-            return list(val)
+            return list(val)  # type: ignore[arg-type]
 
-    # ---- V0 primary: model_executor.driver_worker (GPUExecutor layout) ----
-    v0_paths = [
-        "model_executor.driver_worker.model_runner.kv_cache",
-        "model_executor.driver_worker.cache_engine[0].gpu_cache",
-    ]
-    for path in v0_paths:
-        val = _getattr_path(engine, path)
-        if _valid_kv(val):
-            return list(val)
-
-    # ---- V0: engine.workers list ----
+    # Fallback: engine.workers list (multi-worker V0)
     workers = getattr(engine, "workers", None)
     if workers:
         worker = workers[0]
-        for attr in [
-            "model_runner.kv_cache",
-            "cache_engine[0].gpu_cache",
-        ]:
+        for attr in ["cache_engine[0].gpu_cache", "model_runner.kv_cache"]:
             val = _getattr_path(worker, attr)
             if _valid_kv(val):
                 return list(val)  # type: ignore[arg-type]
 
-    # ---- V0: cache_engine directly on engine ----
+    # Fallback: cache_engine directly on engine
     ce = getattr(engine, "cache_engine", None)
     if ce is not None:
         if isinstance(ce, list):
@@ -147,35 +145,19 @@ def _find_kv_caches(engine: Any) -> List[torch.Tensor]:
         if _valid_kv(gpu):
             return list(gpu)  # type: ignore[arg-type]
 
-    # ---- Last resort: depth-first search for any list of KV tensors ----
-    return _search_kv_caches(engine, depth=0)
+    return []
 
 
 def _valid_kv(val: Any) -> bool:
-    """Return True if val looks like a list of per-layer KV tensors."""
+    """Return True if val looks like a list of per-layer KV tensors.
+
+    Accepts both the 5-D vLLM V1 layout ``[2, blocks, block_size, heads, dim]``
+    and the 3-D flat V0 layout ``[2, blocks, flat_dim]``.
+    """
     if not isinstance(val, (list, tuple)) or len(val) == 0:
         return False
     first = val[0]
-    # Each element should be a tensor with at least 3 dims (2, blocks, block_size, ...)
-    return hasattr(first, "shape") and len(first.shape) >= 3
-
-
-def _search_kv_caches(obj: Any, depth: int) -> List[torch.Tensor]:
-    """Recursively search object attributes for KV cache tensors (max depth 5)."""
-    if depth > 5:
-        return []
-    for attr in vars(obj) if hasattr(obj, "__dict__") else []:
-        try:
-            val = getattr(obj, attr)
-            if _valid_kv(val):
-                return list(val)
-            if hasattr(val, "__dict__") and depth < 5:
-                result = _search_kv_caches(val, depth + 1)
-                if result:
-                    return result
-        except Exception:
-            pass
-    return []
+    return hasattr(first, "shape") and len(first.shape) >= 2
 
 
 def _find_block_size(engine: Any, kv_caches: List[torch.Tensor]) -> int:
@@ -187,8 +169,9 @@ def _find_block_size(engine: Any, kv_caches: List[torch.Tensor]) -> int:
         val = _getattr_path(engine, path)
         if isinstance(val, int) and val > 0:
             return val
-    # Infer from KV cache shape: [2, total_blocks, block_size, heads, dim]
-    if kv_caches and len(kv_caches[0].shape) >= 3:
+    # Infer from 5-D shape [2, blocks, block_size, heads, dim] only.
+    # The 3-D flat layout does not encode block_size in its shape.
+    if kv_caches and len(kv_caches[0].shape) >= 4:
         return kv_caches[0].shape[2]
     return 16  # vLLM default
 

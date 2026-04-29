@@ -90,17 +90,17 @@ class TestTokensPerBlock:
 class TestComputeBlockScores:
     def test_output_shape(self) -> None:
         kv = make_kv_caches(num_layers=2, num_blocks=8, block_size=4)
-        s = compute_block_scores(kv, [0, 1, 2], [4, 4, 3])
+        s = compute_block_scores(kv, [0, 1, 2], [4, 4, 3], block_size=4)
         assert s.shape == (3,)
 
     def test_empty(self) -> None:
         kv = make_kv_caches()
-        s = compute_block_scores(kv, [], [])
+        s = compute_block_scores(kv, [], [], block_size=16)
         assert s.numel() == 0
 
     def test_all_finite(self) -> None:
         kv = make_kv_caches(num_layers=1, num_blocks=4, block_size=8)
-        s = compute_block_scores(kv, [0, 1], [8, 3])
+        s = compute_block_scores(kv, [0, 1], [8, 3], block_size=8)
         assert s.isfinite().all()
 
 
