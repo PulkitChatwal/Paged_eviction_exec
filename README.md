@@ -131,29 +131,3 @@ print("\nStats:", mgr.get_stats())
 ```
 
 ---
-
-## What the stats mean
-
-```python
-{
-  'active_sequences': 1,        # sequences currently tracked
-  'total_decode_evictions': 4,  # blocks evicted during generation
-  'cache_budget': 1024,         # your configured token budget
-  'block_size': 16              # tokens per vLLM page
-}
-```
-
-`total_decode_evictions > 0` means the prompt exceeded your budget and eviction fired. Each eviction frees 16 tokens worth of KV cache memory.
-
----
-
-## Supported models
-
-Any model vLLM supports — architecture does not matter. Tested with:
-
-- `Qwen/Qwen2.5-1.5B-Instruct`
-- `Qwen/Qwen3-1.7B`
-- `meta-llama/Llama-3.2-1B-Instruct`
-- `mistralai/Mistral-7B-Instruct-v0.3`
-
----
