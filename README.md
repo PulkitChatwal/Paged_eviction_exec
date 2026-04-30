@@ -157,16 +157,3 @@ Any model vLLM supports — architecture does not matter. Tested with:
 - `mistralai/Mistral-7B-Instruct-v0.3`
 
 ---
-
-## Citation
-
-```bibtex
-@inproceedings{chittyvenkata2026pagedeviction,
-  title     = {PagedEviction: Structured Block-wise {KV} Cache Pruning for
-               Efficient Large Language Model Inference},
-  author    = {Chitty-Venkata, Krishna Teja and others},
-  booktitle = {Findings of EACL 2026},
-  year      = {2026},
-  url       = {https://aclanthology.org/2026.findings-eacl.168},
-}
-```
