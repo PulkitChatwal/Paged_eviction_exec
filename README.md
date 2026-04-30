@@ -1,9 +1,5 @@
 # PagedEviction for vLLM
 
-Block-wise KV cache pruning for vLLM — implementation of the EACL 2026 paper by Chitty-Venkata et al.
-
-> **Paper:** [PagedEviction: Structured Block-wise KV Cache Pruning](https://aclanthology.org/2026.findings-eacl.168)
-
 ---
 
 ## Requirements
